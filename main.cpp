@@ -6,11 +6,8 @@
 #include <map>
 #include <unordered_map>
 
-std::stringstream load_file(const std::filesystem::path &path) {
-    auto file = std::ifstream(path);
-    auto stream = std::stringstream();
-    stream << file.rdbuf();
-    return stream;
+std::ifstream load_file(const std::filesystem::path &path) {
+    return std::ifstream(path);
 }
 
 struct data_entry {
