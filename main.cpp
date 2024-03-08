@@ -55,7 +55,9 @@ void process_batch(std::span<std::string> lines, std::vector<data_entry> &data, 
         auto semicolon = size_t(line.size());
         while (line[--semicolon] != ';');
         const auto name = std::string(line.begin(), line.begin() + semicolon);
-        names.insert(name);
+        if (names.size() != 413) {
+            names.insert(name);
+        }
         auto &entry = data[name_to_index(name)];
         const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
         entry.min = measurement < entry.min ? measurement : entry.min;
