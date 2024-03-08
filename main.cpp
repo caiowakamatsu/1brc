@@ -4,8 +4,9 @@
 #include <fstream>
 #include <ranges>
 #include <sstream>
-#include <unordered_map>
 #include <set>
+
+#include "concurrentqueue.h"
 
 float parse_float(std::string_view input) {
     float result = 0.0f;
@@ -24,13 +25,14 @@ float parse_float(std::string_view input) {
 }
 
 [[nodiscard]] std::uint64_t name_to_index(const std::string &name) {
-    return (std::hash<std::string>()(name) * 336043159889533) >> 50;
+    const auto result = (std::hash<std::string>()(name) * 336043159889533) >> 50;
+    return result;
 }
 
 struct data_entry {
     float min = std::numeric_limits<float>::infinity();
     float max = -std::numeric_limits<float>::infinity();
-    float mean = 0.0f;
+    float sum = 0.0f;
     float count = 0.0f;
 };
 
@@ -42,7 +44,7 @@ void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
     auto it = names.begin();
     while (it != names.end()) {
         const auto &entry = data[name_to_index(*it)];
-        std::cout << *it << '=' << entry.min << '/' << entry.mean << '/' << entry.max;
+        std::cout << *it << '=' << entry.min << '/' << entry.sum / entry.count << '/' << entry.max;
         if (++it != names.end()) {
             std::cout << ", ";
         }
@@ -50,19 +52,17 @@ void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
     std::cout << '}';
 }
 
-void process_batch(std::span<std::string> lines, std::vector<data_entry> &data, std::set<std::string> &names) {
+void process_batch(std::span<std::string> lines, std::vector<data_entry> &data, const std::function<void(std::string_view)> &handle_name) {
     for (const auto &line : lines) {
         auto semicolon = size_t(line.size());
         while (line[--semicolon] != ';');
         const auto name = std::string(line.begin(), line.begin() + semicolon);
-        if (names.size() != 413) {
-            names.insert(name);
-        }
+        handle_name(name);
         auto &entry = data[name_to_index(name)];
         const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
         entry.min = measurement < entry.min ? measurement : entry.min;
         entry.max = measurement > entry.max ? measurement : entry.max;
-        entry.mean = ((entry.mean * entry.count) + measurement) / (entry.count + 1.0f);
+        entry.sum += measurement;
         entry.count += 1.0f;
     }
 }
@@ -103,17 +103,77 @@ private:
     size_t cursor;
 };
 
+constexpr auto batch_size = 256;
+using reader = buffered_batch_reader<batch_size>;
+using batch_data = reader::batch_read_result;
+
+std::vector<std::thread> dispatch_threads(
+        moodycamel::ConcurrentQueue<batch_data> &queue,
+        std::vector<std::vector<data_entry>> &entries,
+        std::set<std::string> &names,
+        std::atomic<bool> &running) {
+    const auto thread_count = std::thread::hardware_concurrency() - 1;
+
+    auto threads = std::vector<std::thread>();
+
+    for (size_t i = 0; i < thread_count; i++) {
+        threads.emplace_back([&, i](){
+            auto &data = entries[i];
+            data.resize(32'768);
+
+            while (running) {
+                auto batch_result = batch_data();
+                if (queue.try_dequeue(batch_result)) {
+                    process_batch(
+                            {batch_result.lines.begin(), batch_result.lines.begin() + batch_result.count},
+                            data, [&, i](std::string_view name){
+                               if (i == 0 && names.size() != 413) {
+                                   names.insert(std::string(name));
+                               }
+                            });
+                }
+            }
+        });
+    }
+
+    return threads;
+}
+
 int main() {
-    auto reader = buffered_batch_reader<4096>("measurements.txt");
     auto data = std::vector<data_entry>(32'768);
+    auto entries = std::vector<std::vector<data_entry>>(std::thread::hardware_concurrency() - 1);
     auto names = std::set<std::string>();
 
-    while (true) {
-        auto batch_result = reader.next_batch();
-        if (batch_result.count == 0) {
-            break;
+    auto queue = moodycamel::ConcurrentQueue<batch_data>();
+
+    auto running = std::atomic<bool>(true);
+
+    auto producer_thread = std::thread([&](){
+        auto reader = buffered_batch_reader<batch_size>("measurements_large.txt");
+        while (true) {
+            auto batch_result = reader.next_batch();
+            if (batch_result.count == 0) {
+                break;
+            }
+            queue.enqueue(batch_result);
         }
-        process_batch({batch_result.lines.begin(), batch_result.lines.begin() + batch_result.count}, data, names);
+        running = false;
+    });
+
+    for (auto &thread : dispatch_threads(queue, entries, names, running)) {
+        thread.join();
+    }
+    producer_thread.join();
+
+    for (size_t i = 0; i < data.size(); i++) {
+        auto &result = data[i];
+        for (const auto &entry : entries) {
+            auto &against = entry[i];
+            result.min = against.min < result.min ? against.min : result.min;
+            result.max = against.max > result.max ? against.max : result.max;
+            result.sum += against.sum;
+            result.count += against.count;
+        }
     }
 
     output_batch(names, data);
