@@ -23,6 +23,10 @@ float parse_float(std::string_view input) {
     return result;
 }
 
+[[nodiscard]] std::uint64_t name_to_index(const std::string &name) {
+    return (std::hash<std::string>()(name) * 336043159889533) >> 50;
+}
+
 struct data_entry {
     float min = std::numeric_limits<float>::infinity();
     float max = -std::numeric_limits<float>::infinity();
@@ -30,14 +34,14 @@ struct data_entry {
     float count = 0.0f;
 };
 
-void output_batch(std::set<std::string> &names, std::unordered_map<std::string, data_entry> &data) {
+void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
     std::cout << '{';
     std::cout << std::fixed;
     std::cout << std::setprecision(1);
 
     auto it = names.begin();
     while (it != names.end()) {
-        const auto &entry = data[*it];
+        const auto &entry = data[name_to_index(*it)];
         std::cout << *it << '=' << entry.min << '/' << entry.mean << '/' << entry.max;
         if (++it != names.end()) {
             std::cout << ", ";
@@ -46,13 +50,13 @@ void output_batch(std::set<std::string> &names, std::unordered_map<std::string, 
     std::cout << '}';
 }
 
-void process_batch(std::span<std::string> lines, std::unordered_map<std::string, data_entry> &data, std::set<std::string> &names) {
+void process_batch(std::span<std::string> lines, std::vector<data_entry> &data, std::set<std::string> &names) {
     for (const auto &line : lines) {
         auto semicolon = size_t(line.size());
         while (line[--semicolon] != ';');
         const auto name = std::string(line.begin(), line.begin() + semicolon);
         names.insert(name);
-        auto &entry = data[name];
+        auto &entry = data[name_to_index(name)];
         const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
         entry.min = measurement < entry.min ? measurement : entry.min;
         entry.max = measurement > entry.max ? measurement : entry.max;
@@ -99,7 +103,7 @@ private:
 
 int main() {
     auto reader = buffered_batch_reader<4096>("measurements.txt");
-    auto data = std::unordered_map<std::string, data_entry>();
+    auto data = std::vector<data_entry>(32'768);
     auto names = std::set<std::string>();
 
     while (true) {
