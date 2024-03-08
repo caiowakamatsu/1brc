@@ -1,6 +1,7 @@
 #include <iostream>
 #include <filesystem>
 #include <fstream>
+#include <ranges>
 #include <sstream>
 #include <vector>
 #include <map>
@@ -8,6 +9,22 @@
 
 std::ifstream load_file(const std::filesystem::path &path) {
     return std::ifstream(path);
+}
+
+float parse_float(std::string_view input) {
+    float result = 0.0f;
+
+    float multiplier = 0.1f;
+    for (char c : std::ranges::reverse_view(input)) {
+        if (c == '-') {
+            result *= -1.0f;
+        } else if (c != '.') {
+            result += static_cast<float>(c - '0') * multiplier;
+            multiplier *= 10.0f;
+        }
+    }
+
+    return result;
 }
 
 struct data_entry {
@@ -26,7 +43,7 @@ int main() {
         while (line[--semicolon] != ';');
         const auto name = std::string(line.begin(), line.begin() + semicolon);
         auto &entry = data[name];
-        const auto measurement = std::stof(std::string(line.begin() + semicolon + 1, line.end()));
+        const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
         entry.min = measurement < entry.min ? measurement : entry.min;
         entry.max = measurement > entry.max ? measurement : entry.max;
         entry.mean = ((entry.mean * entry.count) + measurement) / (entry.count + 1.0f);
