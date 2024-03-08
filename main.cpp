@@ -4,7 +4,8 @@
 #include <fstream>
 #include <ranges>
 #include <sstream>
-#include <map>
+#include <unordered_map>
+#include <set>
 
 float parse_float(std::string_view input) {
     float result = 0.0f;
@@ -29,26 +30,28 @@ struct data_entry {
     float count = 0.0f;
 };
 
-void output_batch(std::map<std::string, data_entry> &data) {
+void output_batch(std::set<std::string> &names, std::unordered_map<std::string, data_entry> &data) {
     std::cout << '{';
     std::cout << std::fixed;
     std::cout << std::setprecision(1);
-    auto it = data.begin();
-    while (it != data.end()) {
-        const auto &[name, entry] = *it;
-        std::cout << name << '=' << entry.min << '/' << entry.mean << '/' << entry.max;
-        if (++it != data.end()) {
+
+    auto it = names.begin();
+    while (it != names.end()) {
+        const auto &entry = data[*it];
+        std::cout << *it << '=' << entry.min << '/' << entry.mean << '/' << entry.max;
+        if (++it != names.end()) {
             std::cout << ", ";
         }
     }
     std::cout << '}';
 }
 
-void process_batch(std::span<std::string> lines, std::map<std::string, data_entry> &data) {
+void process_batch(std::span<std::string> lines, std::unordered_map<std::string, data_entry> &data, std::set<std::string> &names) {
     for (const auto &line : lines) {
         auto semicolon = size_t(line.size());
         while (line[--semicolon] != ';');
         const auto name = std::string(line.begin(), line.begin() + semicolon);
+        names.insert(name);
         auto &entry = data[name];
         const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
         entry.min = measurement < entry.min ? measurement : entry.min;
@@ -62,10 +65,12 @@ template <size_t MaxBatchSize>
 class buffered_batch_reader {
 public:
     explicit buffered_batch_reader(const std::filesystem::path& path) : cursor(0) {
-        auto file = std::ifstream(path);
-        auto stream = std::stringstream();
-        stream << file.rdbuf();
-        buffer = stream.str();
+        auto file = std::ifstream(path, std::ios::ate);
+        std::streamsize size = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        buffer.resize(size, ' ');
+        file.read(buffer.data(), size);
     }
 
     struct batch_read_result {
@@ -94,17 +99,18 @@ private:
 
 int main() {
     auto reader = buffered_batch_reader<4096>("measurements.txt");
-    auto data = std::map<std::string, data_entry>();
+    auto data = std::unordered_map<std::string, data_entry>();
+    auto names = std::set<std::string>();
 
     while (true) {
         auto batch_result = reader.next_batch();
         if (batch_result.count == 0) {
             break;
         }
-        process_batch({batch_result.lines.begin(), batch_result.lines.begin() + batch_result.count}, data);
+        process_batch({batch_result.lines.begin(), batch_result.lines.begin() + batch_result.count}, data, names);
     }
 
-    output_batch(data);
+    output_batch(names, data);
 
     return 0;
 }
