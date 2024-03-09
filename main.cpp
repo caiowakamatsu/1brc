@@ -42,8 +42,8 @@ struct data_entry {
     }
 };
 
-[[nodiscard]] size_t index_from_name(const std::string &name) {
-    return (std::hash<std::string>()(name) * 336043159889533) >> 49;
+[[nodiscard]] size_t index_from_name(std::string_view name) {
+    return (std::hash<std::string_view>()(name) * 336043159889533) >> 49;
 }
 
 void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
@@ -126,9 +126,9 @@ int main() {
         for (const auto &line : lines) {
             auto semicolon = size_t(line.size());
             while (line[--semicolon] != ';');
-            const auto name = std::string(line.begin(), line.begin() + semicolon);
+            const auto name = std::string_view(line.begin(), line.begin() + semicolon);
             if (names.size() != 413) {
-                names.insert(name);
+                names.insert(std::string(name));
             }
             const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
             stats[index_from_name(name)].accumulate(measurement);
