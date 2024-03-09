@@ -12,33 +12,37 @@
 #include "flat_hash_map.hpp"
 #include "concurrentqueue.h"
 
-float parse_float(std::string_view input) {
-    float result = 0.0f;
-
-    float multiplier = 0.1f;
-    for (char c : std::ranges::reverse_view(input)) {
-        if (c == '-') {
-            result *= -1.0f;
-        } else if (c != '.') {
-            result += static_cast<float>(c - '0') * multiplier;
-            multiplier *= 10.0f;
+int parse_float(std::string_view input) {
+    if (input[0] == '-') {
+        if (input.length() == 5) {
+            // -XX.X
+            return -(((input[1] - '0') * 100) + ((input[2] - '0') * 10) + (input[4] - '0'));
+        } else if (input.length() == 4) {
+            // -X.X
+            return -(((input[1] - '0') * 10) + (input[3] - '0'));
+        }
+    } else {
+        if (input.length() == 4) {
+            // XX.X
+            return ((input[0] - '0') * 100) + ((input[1] - '0') * 10) + (input[3] - '0');
+        } else if (input.length() == 3) {
+            // X.X
+            return ((input[0] - '0') * 10) + (input[2] - '0');
         }
     }
-
-    return result;
 }
 
 struct data_entry {
-    float min = std::numeric_limits<float>::infinity();
-    float max = -std::numeric_limits<float>::infinity();
-    float sum = 0.0f;
-    float count = 0.0f;
+    int min = std::numeric_limits<int>::max();
+    int max = -std::numeric_limits<int>::max();
+    int sum = 0;
+    int count = 0.;
 
-    void accumulate(float measurement) {
+    void accumulate(int measurement) {
         min = std::min(min, measurement);
         max = std::max(max, measurement);
         sum += measurement;
-        count += 1.0f;
+        count += 1;
     }
 };
 
@@ -54,7 +58,11 @@ void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
     auto it = names.begin();
     while (it != names.end()) {
         const auto &entry = data[index_from_name(*it)];
-        std::cout << *it << '=' << entry.min << '/' << entry.sum / entry.count << '/' << entry.max;
+        std::cout << *it << '='
+            << static_cast<float>(entry.min) * 0.1f << '/'
+            << (static_cast<float>(entry.sum) * 0.1f) / static_cast<float>(entry.count)
+            << '/'
+            << static_cast<float>(entry.max) * 0.1f;
         if (++it != names.end()) {
             std::cout << ", ";
         }
