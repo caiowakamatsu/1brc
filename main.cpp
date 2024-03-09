@@ -62,40 +62,77 @@ void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
     std::cout << '}';
 }
 
-void read_lines(std::string path, std::function<void(std::string_view line)> reader) {
-    auto file = std::ifstream(path, std::ios::ate);
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
+void read_lines(std::string path, std::function<void(std::span<std::string_view> line)> reader) {
+    int fd = open(path.c_str(), O_RDONLY);
+    int kq = kqueue();
+    struct kevent event;
+    EV_SET(&event, fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    kevent(kq, &event, 1, NULL, 0, NULL);
 
-    auto buffer = std::string(size, ' ');
-    file.read(buffer.data(), size);
+    auto back_buffer = std::string(8'192, '$');
+    auto lines = std::vector<std::string_view>();
 
-    auto lines = std::vector<std::string>();
-    auto current = std::string();
-    for (auto c : buffer) {
-        if (c == '\n') {
-            reader(current);
-            lines.push_back(current);
-            current = "";
+    while (true) {
+        int nevents = kevent(kq, NULL, 0, &event, 1, NULL);
+        if (nevents == -1) {
+            perror("kevent");
+            exit(EXIT_FAILURE);
+        }
+
+        if (nevents > 0 && event.filter == EVFILT_READ) {
+            const auto first_empty = back_buffer.find_first_of('$');
+            ssize_t bytes_read = read(fd, back_buffer.data() + first_empty, back_buffer.size() - first_empty);
+            if (bytes_read == -1) {
+                perror("read");
+                exit(EXIT_FAILURE);
+            }
+            if (bytes_read == 0) {
+                break;
+            }
+
+            auto current = back_buffer.begin();
+            lines.clear();
+            for (size_t i = 0; i < back_buffer.size(); i++) {
+                auto c = back_buffer[i];
+                if (c == '\n') {
+                    lines.emplace_back(current, back_buffer.begin() + i);
+                    current = back_buffer.begin() + i + 1;
+                }
+            }
+            reader(lines);
+
+            if (bytes_read != back_buffer.size() - first_empty) {
+                break;
+            }
+
+            const auto last_new_line = back_buffer.find_last_of('\n') + 1;
+            const auto remaining = std::string_view(back_buffer.begin() + last_new_line, back_buffer.end());
+            std::memcpy(back_buffer.data(), remaining.data(), remaining.size());
+            std::memset(back_buffer.data() + remaining.size(), '$', back_buffer.size() - remaining.size());
         } else {
-            current.push_back(c);
+            break;
         }
     }
+
+    close(fd);
+    close(kq);
 }
 
 int main() {
     auto names = std::set<std::string>();
     auto stats = std::vector<data_entry>(32'768);
 
-    read_lines("measurements.txt", [&](std::string_view line){
-        auto semicolon = size_t(line.size());
-        while (line[--semicolon] != ';');
-        const auto name = std::string(line.begin(), line.begin() + semicolon);
-        if (names.size() != 413) {
-            names.insert(name);
+    read_lines("measurements_large.txt", [&](std::span<std::string_view> lines){
+        for (const auto &line : lines) {
+            auto semicolon = size_t(line.size());
+            while (line[--semicolon] != ';');
+            const auto name = std::string(line.begin(), line.begin() + semicolon);
+            if (names.size() != 413) {
+                names.insert(name);
+            }
+            const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
+            stats[index_from_name(name)].accumulate(measurement);
         }
-        const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
-        stats[index_from_name(name)].accumulate(measurement);
     });
 
     output_batch(names, stats);

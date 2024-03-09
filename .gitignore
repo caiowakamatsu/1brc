@@ -1,5 +1,3 @@
 /cmake-build-*/
 /.idea/
-measurements.txt
-measurements_small.txt
-measurements_large.txt
+measurements*.txt
