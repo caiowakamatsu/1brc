@@ -81,8 +81,8 @@ void read_lines(std::string path, moodycamel::ConcurrentQueue<std::string_view> 
     }
 
     running = false;
+    munmap(file_content, file_size);
     close(fd);
-//    close(kq);
 }
 
 std::vector<std::thread> dispatch_to_threads(
