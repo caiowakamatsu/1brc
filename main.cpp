@@ -1,32 +1,24 @@
 #include <iostream>
-#include <array>
-#include <filesystem>
 #include <fstream>
-#include <ranges>
-#include <sstream>
 #include <set>
-#include <sys/event.h>
 #include <sys/fcntl.h>
-#include <print>
-
+#include <sys/mman.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include "flat_hash_map.hpp"
 #include "concurrentqueue.h"
 
 int parse_float(std::string_view input) {
     if (input[0] == '-') {
         if (input.length() == 5) {
-            // -XX.X
             return -(((input[1] - '0') * 100) + ((input[2] - '0') * 10) + (input[4] - '0'));
         } else if (input.length() == 4) {
-            // -X.X
             return -(((input[1] - '0') * 10) + (input[3] - '0'));
         }
     } else {
         if (input.length() == 4) {
-            // XX.X
             return ((input[0] - '0') * 100) + ((input[1] - '0') * 10) + (input[3] - '0');
         } else if (input.length() == 3) {
-            // X.X
             return ((input[0] - '0') * 10) + (input[2] - '0');
         }
     }
@@ -36,7 +28,7 @@ struct data_entry {
     int min = std::numeric_limits<int>::max();
     int max = -std::numeric_limits<int>::max();
     int sum = 0;
-    int count = 0.;
+    int count = 0;
 
     void accumulate(int measurement) {
         min = std::min(min, measurement);
@@ -70,55 +62,33 @@ void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
     std::cout << '}';
 }
 
-void read_lines(std::string path, moodycamel::ConcurrentQueue<std::string> &queue, std::atomic<bool> &running) {
+void read_lines(std::string path, moodycamel::ConcurrentQueue<std::string_view> &queue, std::atomic<bool> &running) {
     int fd = open(path.c_str(), O_RDONLY);
-    int kq = kqueue();
-    struct kevent event;
-    EV_SET(&event, fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-    kevent(kq, &event, 1, NULL, 0, NULL);
+    struct stat sb;
+    size_t file_cursor = 0;
+    fstat(fd, &sb);
+    size_t file_size = sb.st_size;
+    char* file_content = static_cast<char*>(mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
 
-    auto back_buffer = std::string(8'192 * 4, '$');
-    while (true) {
-        int nevents = kevent(kq, NULL, 0, &event, 1, NULL);
-        if (nevents == -1) {
-            perror("kevent");
-            exit(EXIT_FAILURE);
-        }
+    const size_t buffer_size = 13000;
 
-        if (nevents > 0 && event.filter == EVFILT_READ) {
-            const auto first_empty = back_buffer.find_first_of('$');
-            ssize_t bytes_read = read(fd, back_buffer.data() + first_empty, back_buffer.size() - first_empty);
-            if (bytes_read == -1) {
-                perror("read");
-                exit(EXIT_FAILURE);
-            }
-            if (bytes_read == 0) {
-                break;
-            }
-
-            const auto last_new_line = back_buffer.find_last_of('\n') + 1;
-            queue.enqueue(std::string(back_buffer.begin(), back_buffer.begin() + last_new_line));
-
-            if (bytes_read != back_buffer.size() - first_empty) {
-                break;
-            }
-            const auto remaining = std::string_view(back_buffer.begin() + last_new_line, back_buffer.end());
-            std::memcpy(back_buffer.data(), remaining.data(), remaining.size());
-            back_buffer[remaining.size()] = '$';
-        } else {
-            break;
-        }
+    while (file_cursor != file_size) {
+        const size_t remaining = file_size - file_cursor;
+        auto end = std::min(buffer_size, remaining) + file_cursor;
+        while (file_content[--end] != '\n');
+        queue.enqueue({file_content + file_cursor, file_content + end});
+        file_cursor = end + 1;
     }
 
     running = false;
     close(fd);
-    close(kq);
+//    close(kq);
 }
 
 std::vector<std::thread> dispatch_to_threads(
         std::set<std::string> &names,
         std::vector<std::vector<data_entry>> &entries,
-        moodycamel::ConcurrentQueue<std::string> &queue,
+        moodycamel::ConcurrentQueue<std::string_view> &queue,
         std::uint32_t thread_count,
         std::atomic<bool> &running) {
     auto threads = std::vector<std::thread>();
@@ -162,7 +132,7 @@ int main() {
     auto names = std::set<std::string>();
     auto stats = std::vector<data_entry>(32'768);
     auto entries = std::vector<std::vector<data_entry>>();
-    auto queue = moodycamel::ConcurrentQueue<std::string>();
+    auto queue = moodycamel::ConcurrentQueue<std::string_view>();
     auto running = std::atomic<bool>(true);
 
     auto producer = std::thread([&](){
