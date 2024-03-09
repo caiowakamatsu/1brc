@@ -62,16 +62,14 @@ void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
     std::cout << '}';
 }
 
-void read_lines(std::string path, std::function<void(std::span<std::string_view> line)> reader) {
+void read_lines(std::string path, moodycamel::ConcurrentQueue<std::string> &queue, std::atomic<bool> &running) {
     int fd = open(path.c_str(), O_RDONLY);
     int kq = kqueue();
     struct kevent event;
     EV_SET(&event, fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
     kevent(kq, &event, 1, NULL, 0, NULL);
 
-    auto back_buffer = std::string(8'192, '$');
-    auto lines = std::vector<std::string_view>();
-
+    auto back_buffer = std::string(8'192 * 4, '$');
     while (true) {
         int nevents = kevent(kq, NULL, 0, &event, 1, NULL);
         if (nevents == -1) {
@@ -90,22 +88,12 @@ void read_lines(std::string path, std::function<void(std::span<std::string_view>
                 break;
             }
 
-            auto current = back_buffer.begin();
-            lines.clear();
-            for (size_t i = 0; i < back_buffer.size(); i++) {
-                auto c = back_buffer[i];
-                if (c == '\n') {
-                    lines.emplace_back(current, back_buffer.begin() + i);
-                    current = back_buffer.begin() + i + 1;
-                }
-            }
-            reader(lines);
+            const auto last_new_line = back_buffer.find_last_of('\n') + 1;
+            queue.enqueue(std::string(back_buffer.begin(), back_buffer.begin() + last_new_line));
 
             if (bytes_read != back_buffer.size() - first_empty) {
                 break;
             }
-
-            const auto last_new_line = back_buffer.find_last_of('\n') + 1;
             const auto remaining = std::string_view(back_buffer.begin() + last_new_line, back_buffer.end());
             std::memcpy(back_buffer.data(), remaining.data(), remaining.size());
             std::memset(back_buffer.data() + remaining.size(), '$', back_buffer.size() - remaining.size());
@@ -114,26 +102,81 @@ void read_lines(std::string path, std::function<void(std::span<std::string_view>
         }
     }
 
+    running = false;
     close(fd);
     close(kq);
 }
 
+std::vector<std::thread> dispatch_to_threads(
+        std::set<std::string> &names,
+        std::vector<std::vector<data_entry>> &entries,
+        moodycamel::ConcurrentQueue<std::string> &queue,
+        std::uint32_t thread_count,
+        std::atomic<bool> &running) {
+    auto threads = std::vector<std::thread>();
+
+    for (auto i = 0; i < thread_count; i++) {
+        entries.emplace_back(32'768);
+    }
+
+    for (std::uint32_t i = 0; i < thread_count; i++) {
+        threads.emplace_back([&, i] () {
+            auto &stats = entries[i];
+            auto lines = std::string();
+            while (running) {
+                if (queue.try_dequeue(lines)) {
+                    auto current = lines.begin();
+                    for (size_t j = 0; j < lines.size(); j++) {
+                        if (lines[j] == '\n') {
+                            const auto line = std::string_view(current, lines.begin() + j);
+                            auto semicolon = size_t(line.size());
+                            while (line[--semicolon] != ';');
+                            const auto name = std::string_view(line.begin(), line.begin() + semicolon);
+                            if (i == 0 && names.size() != 413) {
+                                names.insert(std::string(name));
+                            }
+                            const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
+                            stats[index_from_name(name)].accumulate(measurement);
+                            current = lines.begin() + j + 1;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    return threads;
+}
+
 int main() {
+    const auto thread_count = std::thread::hardware_concurrency();
+
     auto names = std::set<std::string>();
     auto stats = std::vector<data_entry>(32'768);
+    auto entries = std::vector<std::vector<data_entry>>();
+    auto queue = moodycamel::ConcurrentQueue<std::string>();
+    auto running = std::atomic<bool>(true);
 
-    read_lines("measurements_large.txt", [&](std::span<std::string_view> lines){
-        for (const auto &line : lines) {
-            auto semicolon = size_t(line.size());
-            while (line[--semicolon] != ';');
-            const auto name = std::string_view(line.begin(), line.begin() + semicolon);
-            if (names.size() != 413) {
-                names.insert(std::string(name));
-            }
-            const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
-            stats[index_from_name(name)].accumulate(measurement);
-        }
+    auto producer = std::thread([&](){
+        read_lines("measurements_large.txt", queue, running);
     });
+
+    for (auto &thread : dispatch_to_threads(names, entries, queue, thread_count, running)) {
+        thread.join();
+    }
+    producer.join();
+
+    for (const auto &name : names) {
+        const auto index = index_from_name(name);
+        auto &to_add_to = stats[index];
+        for (auto &entry : entries) {
+            const auto &against = entry[index];
+            to_add_to.min = std::min(to_add_to.min, against.min);
+            to_add_to.max = std::max(to_add_to.max, against.max);
+            to_add_to.sum += against.sum;
+            to_add_to.count += against.count;
+        }
+    }
 
     output_batch(names, stats);
     return 0;
