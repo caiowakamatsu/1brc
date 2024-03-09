@@ -96,7 +96,7 @@ void read_lines(std::string path, moodycamel::ConcurrentQueue<std::string> &queu
             }
             const auto remaining = std::string_view(back_buffer.begin() + last_new_line, back_buffer.end());
             std::memcpy(back_buffer.data(), remaining.data(), remaining.size());
-            std::memset(back_buffer.data() + remaining.size(), '$', back_buffer.size() - remaining.size());
+            back_buffer[remaining.size()] = '$';
         } else {
             break;
         }
