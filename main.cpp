@@ -152,38 +152,6 @@ line_read_boundaries read_lines(std::string path, std::uint32_t thread_count) {
     }
 }
 
-int32x4_t load_numbers(std::int32_t a, std::int32_t b, std::int32_t c, std::int32_t d) {
-    const auto packed = std::array<std::int32_t, 4>({a, b, c, d});
-    return vld1q_s32(packed.data());
-}
-
-void unload(int32x4_t value, std::int32_t *a, std::int32_t *b, std::int32_t *c, std::int32_t *d) {
-    auto packed = std::array<std::int32_t, 4>();
-    vst1q_s32(packed.data(), value);
-    *a = packed[0];
-    *b = packed[1];
-    *c = packed[2];
-    *d = packed[3];
-}
-
-void simd_accumulate(string_view_map<data_entry> &stats, const std::array<std::string_view, 4> &cities, const std::array<std::int32_t, 4> &m) {
-    const auto one = std::int32_t(1);
-    auto entries = std::array<data_entry*, 4>({&stats[cities[0]], &stats[cities[1]], &stats[cities[2]], &stats[cities[3]] });
-    const auto measurements = load_numbers(m[0], m[1], m[2], m[3]);
-    const auto minimums = load_numbers(entries[0]->min, entries[1]->min, entries[2]->min, entries[3]->min);
-    const auto maximums = load_numbers(entries[0]->max, entries[1]->max, entries[2]->max, entries[3]->max);
-    const auto sums = load_numbers(entries[0]->sum, entries[1]->sum, entries[2]->sum, entries[3]->sum);
-    const auto counts = load_numbers(entries[0]->count, entries[1]->count, entries[2]->count, entries[3]->count);
-    const auto minimums_op = vminq_s32(minimums, measurements);
-    const auto maximums_op = vmaxq_s32(maximums, measurements);
-    const auto sums_op = vaddq_s32(sums, measurements);
-    const auto counts_op = vaddq_s32(counts, vld1q_dup_s32(&one));
-    unload(minimums_op, &entries[0]->min, &entries[1]->min, &entries[2]->min, &entries[3]->min);
-    unload(maximums_op, &entries[0]->max, &entries[1]->max, &entries[2]->max, &entries[3]->max);
-    unload(sums_op, &entries[0]->sum, &entries[1]->sum, &entries[2]->sum, &entries[3]->sum);
-    unload(counts_op, &entries[0]->count, &entries[1]->count, &entries[2]->count, &entries[3]->count);
-}
-
 std::vector<std::thread> dispatch_to_threads(
         std::set<std::string> &names,
         std::vector<string_view_map<data_entry>> &entries,
@@ -213,23 +181,6 @@ std::vector<std::thread> dispatch_to_threads(
                 current = after_measurement + 1;
                 return current < lines.end();
             };
-
-            auto simd_ok = true;
-            simd_exit:
-            while (simd_ok) {
-                const auto before_simd_read = current;
-//                 SIMD loop, 4 loaded at the same time
-                auto loaded_cities = std::array<std::string_view, 4>();
-                auto loaded_measurements = std::array<std::int32_t, 4>();
-                for (int j = 0; j < 4; j++) {
-                    if (!load_next(loaded_cities[j], loaded_measurements[j])) {
-                        current = before_simd_read;
-                        simd_ok = false;
-                        goto simd_exit;
-                    }
-                }
-                simd_accumulate(stats, loaded_cities, loaded_measurements);
-            }
 
             auto city = std::string_view();
             auto measurement = std::int32_t();
