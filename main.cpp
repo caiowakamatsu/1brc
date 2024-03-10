@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <bitset>
 #include <thread>
+#include <arm_neon.h>
 
 
 
@@ -101,7 +102,8 @@ line_read_boundaries read_lines(std::string path, std::uint32_t thread_count) {
     struct stat sb;
     fstat(fd, &sb);
     size_t file_size = sb.st_size;
-    char* file_content = static_cast<char*>(mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
+    // the +64 is for padding just to be safe
+    char* file_content = static_cast<char*>(mmap(NULL, file_size + 64, PROT_READ, MAP_PRIVATE, fd, 0));
 
     auto boundaries = line_read_boundaries();
     boundaries.fd = fd;
@@ -122,8 +124,32 @@ line_read_boundaries read_lines(std::string path, std::uint32_t thread_count) {
 }
 
 [[nodiscard]] std::string_view::iterator find_next(std::string_view::iterator begin, char value) {
-    while (*(++begin) != value);
-    return begin;
+    const auto mask = vld1q_dup_u8(reinterpret_cast<uint8_t const *>(&value));
+    auto count = std::uint64_t(0);
+    while (true) {
+        const auto loaded = vld1q_u8(reinterpret_cast<uint8_t const *>(begin + count * 16));
+        const auto base = begin + count * 16;
+        const auto xored = veorq_s8(loaded, mask);
+        if (vminvq_u8(xored) == 0) {
+            if (vgetq_lane_u8(xored, 0) == 0) return 0 + base;
+            if (vgetq_lane_u8(xored, 1) == 0) return 1 + base;
+            if (vgetq_lane_u8(xored, 2) == 0) return 2 + base;
+            if (vgetq_lane_u8(xored, 3) == 0) return 3 + base;
+            if (vgetq_lane_u8(xored, 4) == 0) return 4 + base;
+            if (vgetq_lane_u8(xored, 5) == 0) return 5 + base;
+            if (vgetq_lane_u8(xored, 6) == 0) return 6 + base;
+            if (vgetq_lane_u8(xored, 7) == 0) return 7 + base;
+            if (vgetq_lane_u8(xored, 8) == 0) return 8 + base;
+            if (vgetq_lane_u8(xored, 9) == 0) return 9 + base;
+            if (vgetq_lane_u8(xored, 10) == 0) return 10 + base;
+            if (vgetq_lane_u8(xored, 11) == 0) return 11 + base;
+            if (vgetq_lane_u8(xored, 12) == 0) return 12 + base;
+            if (vgetq_lane_u8(xored, 13) == 0) return 13 + base;
+            if (vgetq_lane_u8(xored, 14) == 0) return 14 + base;
+            if (vgetq_lane_u8(xored, 15) == 0) return 15 + base;
+        }
+        count += 1;
+    }
 }
 
 std::vector<std::thread> dispatch_to_threads(
