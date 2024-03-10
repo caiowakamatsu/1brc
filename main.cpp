@@ -6,8 +6,34 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <bitset>
-#include "flat_hash_map.hpp"
-#include "concurrentqueue.h"
+#include <thread>
+
+
+
+template <typename ValueT>
+class string_view_map {
+public:
+    explicit string_view_map(std::uint32_t size = 70'000) : size(size), data(size), keys(size) {
+
+    }
+
+    [[nodiscard]] ValueT &operator[](std::string_view key) {
+        auto hash = std::uint32_t(528442133u);
+        for (char c : key) {
+            hash ^= (c * (hash >> 4));
+        }
+        auto index = (hash % 65'536u) - 1;
+        while (++index < size && !keys[index].empty() && (keys[index] != key));
+        keys[index] = key;
+        return data[index];
+    }
+
+private:
+    size_t size = 0;
+    std::vector<ValueT> data = {};
+    std::vector<std::string_view> keys = {};
+
+};
 
 int parse_float(std::string_view input) {
     if (input[0] == '-') {
@@ -25,19 +51,6 @@ int parse_float(std::string_view input) {
     }
 }
 
-std::int32_t parse_float_v2(std::string_view input) {
-    auto in_word = std::int64_t();
-    std::memcpy(&in_word, input.data(), input.size());
-    const auto sign = ((in_word & 0xFF) ^ '-') == 0;
-    const auto first_shift = 8 * (input.size() - 1);
-    auto result = std::int32_t();
-    result += ((in_word >> (first_shift)) & 0xFF) - '0';
-    result += (((in_word >> (first_shift - 16)) & 0xFF) - '0') * 10;
-    result += ((((in_word >> (first_shift - 24)) & 0xFF) - '0') * 100) * (1 - (sign && first_shift != 32));
-    result -= 2 * result * sign;
-    return result;
-}
-
 struct data_entry {
     int min = std::numeric_limits<int>::max();
     int max = -std::numeric_limits<int>::max();
@@ -52,18 +65,14 @@ struct data_entry {
     }
 };
 
-[[nodiscard]] size_t index_from_name(std::string_view name) {
-    return (std::hash<std::string_view>()(name) * 336043159889533) >> 49;
-}
-
-void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
+void output_batch(std::set<std::string> &names, string_view_map<data_entry> &data) {
     std::cout << '{';
     std::cout << std::fixed;
     std::cout << std::setprecision(1);
 
     auto it = names.begin();
     while (it != names.end()) {
-        const auto &entry = data[index_from_name(*it)];
+        const auto &entry = data[*it];
         std::cout << *it << '='
             << static_cast<float>(entry.min) * 0.1f << '/'
             << (static_cast<float>(entry.sum) * 0.1f) / static_cast<float>(entry.count)
@@ -112,15 +121,26 @@ line_read_boundaries read_lines(std::string path, std::uint32_t thread_count) {
     return boundaries;
 }
 
+struct city_parse_result {
+    std::int32_t hash = 0;
+    std::string_view::iterator end = nullptr;
+};
+[[nodiscard]] city_parse_result parse_city(std::string_view::iterator begin, std::string_view::iterator end) {
+    auto result = city_parse_result();
+//    result.hash
+
+    return result;
+}
+
 std::vector<std::thread> dispatch_to_threads(
         std::set<std::string> &names,
-        std::vector<std::vector<data_entry>> &entries,
+        std::vector<string_view_map<data_entry>> &entries,
         line_read_boundaries &tasks,
         std::uint32_t thread_count) {
     auto threads = std::vector<std::thread>();
 
     for (auto i = 0; i < thread_count; i++) {
-        entries.emplace_back(32'768);
+        entries.emplace_back();
     }
 
     for (std::uint32_t i = 0; i < thread_count; i++) {
@@ -128,17 +148,18 @@ std::vector<std::thread> dispatch_to_threads(
             auto &stats = entries[i];
             const auto lines = tasks.boundaries[i];
             auto current = lines.begin();
+
             for (size_t j = 0; j < lines.size(); j++) {
                 if (lines[j] == '\n') {
-                    const auto line = std::string_view(current, lines.begin() + j);
+                    auto line = std::string_view({current, lines.begin() + j});
                     auto semicolon = size_t(line.size());
                     while (line[--semicolon] != ';');
                     const auto name = std::string_view(line.begin(), line.begin() + semicolon);
                     if (i == 0 && names.size() != 413) {
                         names.insert(std::string(name));
                     }
-                    const auto measurement = parse_float_v2({line.begin() + semicolon + 1, line.end()});
-                    stats[index_from_name(name)].accumulate(measurement);
+                    const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
+                    stats[name].accumulate(measurement);
                     current = lines.begin() + j + 1;
                 }
             }
@@ -151,25 +172,57 @@ std::vector<std::thread> dispatch_to_threads(
 // 11001100101110001100100011000100000000
 // 11001100101110001100100011000100101101
 
+std::vector<std::string> get_stations() {
+    auto file = std::ifstream("data/stations.txt");
+    auto line = std::string();
+    auto stations = std::vector<std::string>();
+    while (std::getline(file, line)) {
+        stations.push_back(line);
+    }
+    return stations;
+}
+
+void station_processing_main() {
+    const auto stations = get_stations();
+    auto map = string_view_map<int>();
+    auto other_map = std::unordered_map<std::string, int>();
+
+    auto names = std::set<std::string>();
+    for (const auto &station : stations) {
+        auto value = rand();
+        map[station] = value;
+        other_map[station] = value;
+        names.insert(station);
+    }
+
+    for (auto name : names) {
+        const auto ours = map[name];
+        const auto theirs = map[name];
+        if (ours != theirs) {
+            auto b = 5;
+        }
+    }
+
+    auto a = 5;
+}
 
 int main() {
     const auto thread_count = std::thread::hardware_concurrency();
 
     auto names = std::set<std::string>();
-    auto stats = std::vector<data_entry>(32'768);
-    auto entries = std::vector<std::vector<data_entry>>();
+    auto stats = string_view_map<data_entry>();
+    auto entries = std::vector<string_view_map<data_entry>>();
 
-    auto lines = read_lines("measurements_large.txt", thread_count);
+    auto lines = read_lines("data/measurements_large.txt", thread_count);
 
     for (auto &thread : dispatch_to_threads(names, entries, lines, thread_count)) {
         thread.join();
     }
 
     for (const auto &name : names) {
-        const auto index = index_from_name(name);
-        auto &to_add_to = stats[index];
-        for (auto &entry : entries) {
-            const auto &against = entry[index];
+        auto &to_add_to = stats[name];
+        for (auto &entry: entries) {
+            const auto &against = entry[name];
             to_add_to.min = std::min(to_add_to.min, against.min);
             to_add_to.max = std::max(to_add_to.max, against.max);
             to_add_to.sum += against.sum;
