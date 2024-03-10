@@ -121,15 +121,9 @@ line_read_boundaries read_lines(std::string path, std::uint32_t thread_count) {
     return boundaries;
 }
 
-struct city_parse_result {
-    std::int32_t hash = 0;
-    std::string_view::iterator end = nullptr;
-};
-[[nodiscard]] city_parse_result parse_city(std::string_view::iterator begin, std::string_view::iterator end) {
-    auto result = city_parse_result();
-//    result.hash
-
-    return result;
+[[nodiscard]] std::string_view::iterator find_next(std::string_view::iterator begin, char value) {
+    while (*(++begin) != value);
+    return begin;
 }
 
 std::vector<std::thread> dispatch_to_threads(
@@ -148,20 +142,14 @@ std::vector<std::thread> dispatch_to_threads(
             auto &stats = entries[i];
             const auto lines = tasks.boundaries[i];
             auto current = lines.begin();
-
-            for (size_t j = 0; j < lines.size(); j++) {
-                if (lines[j] == '\n') {
-                    auto line = std::string_view({current, lines.begin() + j});
-                    auto semicolon = size_t(line.size());
-                    while (line[--semicolon] != ';');
-                    const auto name = std::string_view(line.begin(), line.begin() + semicolon);
-                    if (i == 0 && names.size() != 413) {
-                        names.insert(std::string(name));
-                    }
-                    const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
-                    stats[name].accumulate(measurement);
-                    current = lines.begin() + j + 1;
+            while (current < lines.end()) {
+                const auto after_city = find_next(current, ';');
+                const auto after_measurement = find_next(after_city + 1, '\n');
+                stats[{current, after_city}].accumulate(parse_float({after_city + 1, after_measurement}));
+                if (i == 0 && names.size() != 413) {
+                    names.insert(std::string({current, after_city}));
                 }
+                current = after_measurement + 1;
             }
         });
     }
