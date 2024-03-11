@@ -8,32 +8,25 @@
 #include <bitset>
 #include <thread>
 #include <arm_neon.h>
+#include <random>
 
+#include "hash.h"
 
 
 template <typename ValueT>
 class string_view_map {
 public:
-    explicit string_view_map(std::uint32_t size = 70'000) : size(size), data(size), keys(size) {
+    explicit string_view_map(std::uint32_t size = MAX_HASH_VALUE) : data(size) {
 
     }
 
     [[nodiscard]] ValueT &operator[](std::string_view key) {
-        auto hash = std::uint32_t(528442133u);
-        for (char c : key) {
-            hash ^= (c * (hash >> 4));
-        }
-        auto index = (hash % 65'536u) - 1;
-        while (++index < size && !keys[index].empty() && (keys[index] != key));
-        keys[index] = key;
-        return data[index];
+        const auto perfect_hash = hash(key.data(), key.size());
+        return data[perfect_hash];
     }
 
 private:
-    size_t size = 0;
     std::vector<ValueT> data = {};
-    std::vector<std::string_view> keys = {};
-
 };
 
 int parse_float(std::string_view input) {
@@ -202,26 +195,36 @@ std::vector<std::string> get_stations() {
 
 void station_processing_main() {
     const auto stations = get_stations();
-    auto map = string_view_map<int>();
-    auto other_map = std::unordered_map<std::string, int>();
 
     auto names = std::set<std::string>();
     for (const auto &station : stations) {
-        auto value = rand();
-        map[station] = value;
-        other_map[station] = value;
         names.insert(station);
     }
 
-    for (auto name : names) {
-        const auto ours = map[name];
-        const auto theirs = map[name];
-        if (ours != theirs) {
-            auto b = 5;
+    auto rd = std::random_device();
+    auto engine = std::mt19937(rd());
+    auto distribution = std::uniform_int_distribution<uint32_t>();
+
+    const auto hash_name = [](std::string_view name){
+        auto hash = std::uint32_t(528442133u);
+        for (char c : name) {
+            hash ^= (c * (hash >> 4));
+        }
+        return hash;
+    };
+
+    while (true) {
+        const auto number = distribution(engine);
+        auto data = std::set<std::uint32_t>();
+        for (const auto &name : names) {
+            const auto hash = hash_name(name);
+            data.insert((hash * number) >> 19);
+        }
+
+        if (data.size() == names.size()) {
+            std::cout << "Found number that works: " << number << std::endl;
         }
     }
-
-    auto a = 5;
 }
 
 int main() {
