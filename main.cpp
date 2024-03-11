@@ -10,22 +10,124 @@
 #include <arm_neon.h>
 #include <random>
 
-#include "hash.h"
+constexpr auto MAX_HASH_VALUE = 2551458;
+/* maximum key range = 2413318, duplicates = 0 */
+/* This number generated ^^^ by gperf was completely wrong. Had to manually update it for it to work properly.
+ * Why did it break? Who knows, gperf seems to have been released over 20 years ago. I don't doubt that it breaks
+ * for some reason that no one will ever want to fix.
+ */
 
+[[nodiscard]] std::uint32_t hash(const char *str, size_t len)
+{
+    static unsigned int asso_values[] =
+            {
+                    2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381,
+                    2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381,
+                    2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381,
+                    2413381, 2413381,  243092,   97591, 2413381, 2413381,   17969, 2413381, 2413381,       0,
+                    186197,       0, 2413381,       0, 2413381,    1580,    6230,       0,       0,     265,
+                    0,       0,       0,  161777, 2413381,       0, 2413381, 2413381, 2413381, 2413381,
+                    0,       0,       0, 2413381, 2413381,   29365,    1535,    6180,  352559,  437034,
+                    419514,  234107,  323364,  468164,   75948,   14815,  214287,       0,  404274,  425039,
+                    51445,   40716,  339919,    4125,   93896,   58486,  456774,  483419,   64020,  433589,
+                    306994,     540,      30,      15,     155,       0,      30,      10,    2515,  215542,
+                    150102,     285,  121222,   58104,   68721,      15,   57790,   31905,     250,     165,
+                    0,     585,    5975,      60,       5,     755,    1405,     100,      70,     710,
+                    4345,      35,     500,  195837,   19435,   27910,    7015,    1955,  407554,  254537,
+                    123116,   95211,   23670,   11815,   24675,  184542,  383964,   42505,  316839,  112962,
+                    9495,    1415,  227513,   28657,     175,      70,       5,      10,      15,     385,
+                    1950,       5,      25,     320,       0,      30,     250,      30,       5,      35,
+                    0,      65,     255,    3075,      45,     190,      50,      75,     365,    1895,
+                    275,   26350,    4000,    1000,      80,    2030,     655,    1020,     230,    1560,
+                    9490,     415,    4280,     210,      25,     105,     125,      50,    1415,      35,
+                    435,       0,     475,       0,     220,    9115,   31440,   15310,    6300,     150,
+                    11526,    8160,       5,    7400,   40675,    2025,       5,       0,       0,      50,
+                    0,    2650,   27995,     850,       0, 2413381,   10720,   77086,    3530,       0,
+                    2413381, 2413381,       0, 2413381, 2413381,      15,       0,       0, 2413381,       0,
+                    15, 2413381, 2413381,       5,      30, 2413381, 2413381, 2413381, 2413381, 2413381,
+                    2413381,      15,       0, 2413381, 2413381, 2413381,       0,     295, 2413381, 2413381,
+                    2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381,
+                    2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381,
+                    2413381, 2413381, 2413381, 2413381, 2413381, 2413381, 2413381
+            };
+    unsigned int hval = len;
+
+    switch (hval)
+    {
+        default:
+            hval += asso_values[(unsigned char)str[20]+1];
+            /*FALLTHROUGH*/
+        case 20:
+        case 19:
+        case 18:
+        case 17:
+            hval += asso_values[(unsigned char)str[16]];
+            /*FALLTHROUGH*/
+        case 16:
+        case 15:
+        case 14:
+            hval += asso_values[(unsigned char)str[13]];
+            /*FALLTHROUGH*/
+        case 13:
+        case 12:
+        case 11:
+            hval += asso_values[(unsigned char)str[10]+1];
+            /*FALLTHROUGH*/
+        case 10:
+            hval += asso_values[(unsigned char)str[9]];
+            /*FALLTHROUGH*/
+        case 9:
+            hval += asso_values[(unsigned char)str[8]];
+            /*FALLTHROUGH*/
+        case 8:
+            hval += asso_values[(unsigned char)str[7]];
+            /*FALLTHROUGH*/
+        case 7:
+            hval += asso_values[(unsigned char)str[6]+1];
+            /*FALLTHROUGH*/
+        case 6:
+            hval += asso_values[(unsigned char)str[5]+8];
+            /*FALLTHROUGH*/
+        case 5:
+            hval += asso_values[(unsigned char)str[4]+4];
+            /*FALLTHROUGH*/
+        case 4:
+            hval += asso_values[(unsigned char)str[3]+21];
+            /*FALLTHROUGH*/
+        case 3:
+            hval += asso_values[(unsigned char)str[2]];
+            /*FALLTHROUGH*/
+        case 2:
+            hval += asso_values[(unsigned char)str[1]+16];
+            /*FALLTHROUGH*/
+        case 1:
+            hval += asso_values[(unsigned char)str[0]];
+            break;
+    }
+    return hval + asso_values[(unsigned char)str[len - 1]];
+}
 
 template <typename ValueT>
 class string_view_map {
 public:
-    explicit string_view_map(std::uint32_t size = MAX_HASH_VALUE) : data(size) {
-
+    explicit string_view_map(std::uint32_t size = MAX_HASH_VALUE) : index_table(size, -1) {
+        data.reserve(size / 1000); // good enough
     }
 
     [[nodiscard]] ValueT &operator[](std::string_view key) {
         const auto perfect_hash = hash(key.data(), key.size());
+        const auto table_index = index_table[perfect_hash];
+        if (table_index == -1) {
+            index_table[perfect_hash] = data.size();
+            return data.emplace_back();
+        } else {
+            return data[table_index];
+        }
         return data[perfect_hash];
     }
 
 private:
+    std::vector<std::int32_t> index_table = {};
     std::vector<ValueT> data = {};
 };
 
