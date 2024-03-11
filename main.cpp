@@ -125,28 +125,22 @@ line_read_boundaries read_lines(std::string path, std::uint32_t thread_count) {
 
 [[nodiscard]] std::string_view::iterator find_next(std::string_view::iterator begin, char value) {
     const auto mask = vld1q_dup_u8(reinterpret_cast<uint8_t const *>(&value));
+    const auto zero = std::uint8_t(0);
+    const auto zero_vec = vld1q_dup_u8(&zero);
     auto count = std::uint64_t(0);
     while (true) {
         const auto loaded = vld1q_u8(reinterpret_cast<uint8_t const *>(begin + count * 16));
         const auto base = begin + count * 16;
         const auto xored = veorq_s8(loaded, mask);
         if (vminvq_u8(xored) == 0) {
-            if (vgetq_lane_u8(xored, 0) == 0) return 0 + base;
-            if (vgetq_lane_u8(xored, 1) == 0) return 1 + base;
-            if (vgetq_lane_u8(xored, 2) == 0) return 2 + base;
-            if (vgetq_lane_u8(xored, 3) == 0) return 3 + base;
-            if (vgetq_lane_u8(xored, 4) == 0) return 4 + base;
-            if (vgetq_lane_u8(xored, 5) == 0) return 5 + base;
-            if (vgetq_lane_u8(xored, 6) == 0) return 6 + base;
-            if (vgetq_lane_u8(xored, 7) == 0) return 7 + base;
-            if (vgetq_lane_u8(xored, 8) == 0) return 8 + base;
-            if (vgetq_lane_u8(xored, 9) == 0) return 9 + base;
-            if (vgetq_lane_u8(xored, 10) == 0) return 10 + base;
-            if (vgetq_lane_u8(xored, 11) == 0) return 11 + base;
-            if (vgetq_lane_u8(xored, 12) == 0) return 12 + base;
-            if (vgetq_lane_u8(xored, 13) == 0) return 13 + base;
-            if (vgetq_lane_u8(xored, 14) == 0) return 14 + base;
-            if (vgetq_lane_u8(xored, 15) == 0) return 15 + base;
+            const auto compare_result = vceqq_u8(zero_vec, xored);
+            const auto as_u64s = vreinterpretq_u64_u8(compare_result);
+            auto unpacked = std::array<std::uint64_t, 2>();
+            vst1q_u64(unpacked.data(), as_u64s);
+            const auto first = (64 - __builtin_clzll(unpacked[0])) / 8;
+            const auto second = (64 - __builtin_clzll(unpacked[1])) / 8;
+
+            return ((first == 0 ? second + 8 : first) - 1) + base;
         }
         count += 1;
     }
