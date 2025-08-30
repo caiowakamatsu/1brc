@@ -1,182 +1,267 @@
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
-#include <array>
-#include <filesystem>
-#include <fstream>
-#include <ranges>
-#include <sstream>
-#include <set>
+#include <limits>
+#include <memory>
+#include <string_view>
+#include <vector>
 
-#include "concurrentqueue.h"
+#include <iomanip>
+#include <sys/fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-float parse_float(std::string_view input) {
-    float result = 0.0f;
+struct hash_entry {
+  std::int64_t sum = 0;
+  std::uint32_t count = 0;
+  std::int16_t min = std::numeric_limits<std::int16_t>::max();
+  std::int16_t max = std::numeric_limits<std::int16_t>::min();
 
-    float multiplier = 0.1f;
-    for (char c : std::ranges::reverse_view(input)) {
-        if (c == '-') {
-            result *= -1.0f;
-        } else if (c != '.') {
-            result += static_cast<float>(c - '0') * multiplier;
-            multiplier *= 10.0f;
-        }
-    }
-
-    return result;
-}
-
-[[nodiscard]] std::uint64_t name_to_index(const std::string &name) {
-    const auto result = (std::hash<std::string>()(name) * 336043159889533) >> 50;
-    return result;
-}
-
-struct data_entry {
-    float min = std::numeric_limits<float>::infinity();
-    float max = -std::numeric_limits<float>::infinity();
-    float sum = 0.0f;
-    float count = 0.0f;
+  hash_entry operator+=(hash_entry entry) {
+    sum += entry.sum;
+    count += entry.count;
+    min = min < entry.min ? min : entry.min;
+    max = max > entry.max ? max : entry.max;
+    return *this;
+  }
 };
 
-void output_batch(std::set<std::string> &names, std::vector<data_entry> &data) {
+struct city {
+  std::string_view name = {};
+
+  [[nodiscard]] bool operator==(const city &other) const noexcept {
+    return other.name == this->name;
+  }
+
+  [[nodiscard]] std::uint32_t hash() const noexcept {
+    auto hash_value = std::uint32_t();
+
+    const auto size = name.size() < 4 ? name.size() : 4;
+    std::memcpy(&hash_value, name.data(), size);
+
+    return hash_value;
+  }
+};
+
+// KeyT and ValueT should be trivially copyable
+template <typename KeyT, typename ValueT> class hash_map {
+private:
+  std::unique_ptr<ValueT[]> values;
+  std::unique_ptr<KeyT[]> keys;
+  std::uint64_t size;
+
+public:
+  hash_map(std::uint64_t size)
+      : values(std::make_unique<ValueT[]>(size)),
+        keys(std::make_unique<KeyT[]>(size)), size(size) {}
+
+  void update(KeyT key, ValueT value) {
+    const auto hash = key.hash();
+
+    const auto initial_index = hash % size;
+    auto current_index = initial_index;
+    do {
+      if (keys[current_index] == key) {
+        // Found the entry
+        keys[current_index] = key;
+        values[current_index] += value;
+        break;
+      } else if (keys[current_index] == KeyT()) {
+        keys[current_index] = key;
+        // Found an open entry, write
+        values[current_index] = value;
+        break;
+      }
+      // Entry wasn't interesting, continue going forward
+
+      // Automatic loop back
+      current_index = (current_index + 1) % size;
+    } while (current_index != initial_index);
+  }
+
+  [[nodiscard]] hash_map<KeyT, ValueT>
+  merge(const hash_map<KeyT, ValueT> other) const {
+    auto merged = hash_map(*this);
+    for (std::uint64_t i = 0; i < other.size; i++) {
+      if (other.keys[i] != KeyT()) {
+        merged.update(other.keys[i], other.values[i]);
+      }
+    }
+    return merged;
+  }
+
+  hash_map(const hash_map<KeyT, ValueT> &other)
+      : values(std::make_unique<ValueT[]>(size)),
+        keys(std::make_unique<KeyT[]>(size)), size(size) {
+    std::memcpy(values.get(), other.values.get(), sizeof(ValueT) * size);
+    std::memcpy(keys.get(), other.keys.get(), sizeof(keys) * size);
+  }
+
+  void print() const noexcept {
     std::cout << '{';
     std::cout << std::fixed;
     std::cout << std::setprecision(1);
-
-    auto it = names.begin();
-    while (it != names.end()) {
-        const auto &entry = data[name_to_index(*it)];
-        std::cout << *it << '=' << entry.min << '/' << entry.sum / entry.count << '/' << entry.max;
-        if (++it != names.end()) {
-            std::cout << ", ";
+    for (std::uint64_t i = 0; i < size; i++) {
+      if (keys[i] != KeyT()) {
+        const auto &entry = values[i];
+        std::cout << keys[i].name << '=' << static_cast<float>(entry.min) * 0.1f
+                  << '/'
+                  << (static_cast<float>(entry.sum) * 0.1f) /
+                         static_cast<float>(entry.count)
+                  << '/' << static_cast<float>(entry.max) * 0.1f;
+        if (i + 1 != size) {
+          std::cout << ',';
         }
+      }
     }
     std::cout << '}';
-}
-
-void process_batch(std::span<std::string> lines, std::vector<data_entry> &data, const std::function<void(std::string_view)> &handle_name) {
-    for (const auto &line : lines) {
-        auto semicolon = size_t(line.size());
-        while (line[--semicolon] != ';');
-        const auto name = std::string(line.begin(), line.begin() + semicolon);
-        handle_name(name);
-        auto &entry = data[name_to_index(name)];
-        const auto measurement = parse_float({line.begin() + semicolon + 1, line.end()});
-        entry.min = measurement < entry.min ? measurement : entry.min;
-        entry.max = measurement > entry.max ? measurement : entry.max;
-        entry.sum += measurement;
-        entry.count += 1.0f;
-    }
-}
-
-template <size_t MaxBatchSize>
-class buffered_batch_reader {
-public:
-    explicit buffered_batch_reader(const std::filesystem::path& path) : cursor(0) {
-        auto file = std::ifstream(path, std::ios::ate);
-        std::streamsize size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        buffer.resize(size, ' ');
-        file.read(buffer.data(), size);
-    }
-
-    struct batch_read_result {
-        std::array<std::string, MaxBatchSize> lines = {};
-        size_t count = 0;
-    };
-    [[nodiscard]] batch_read_result next_batch() {
-        auto result = batch_read_result();
-
-        while (result.count != MaxBatchSize && cursor < buffer.size()) {
-            auto start = buffer.begin() + cursor;
-            auto end = start;
-            size_t count = 1;
-            while (++count, *(++end) != '\n');
-            result.lines[result.count++] = {start, end};
-            cursor += count;
-        }
-
-        return result;
-    }
-
-private:
-    std::string buffer;
-    size_t cursor;
+  }
 };
 
-constexpr auto batch_size = 256;
-using reader = buffered_batch_reader<batch_size>;
-using batch_data = reader::batch_read_result;
+struct line_read_boundaries {
+  int fd = 0;
+  size_t file_size = 0;
+  char *memory = nullptr;
+  std::vector<std::string_view> boundaries = {};
 
-std::vector<std::thread> dispatch_threads(
-        moodycamel::ConcurrentQueue<batch_data> &queue,
-        std::vector<std::vector<data_entry>> &entries,
-        std::set<std::string> &names,
-        std::atomic<bool> &running) {
-    const auto thread_count = std::thread::hardware_concurrency() - 1;
+  ~line_read_boundaries() {
+    munmap(memory, file_size);
+    close(fd);
+  }
+};
+/**
+ * Sets up all of the required resources for threads to do their work afterwards
+ * @param path Path to measurements file
+ * @param thread_count Amount of threads that will aggregate the data
+ * @return Boundaries and resources required for doing work
+ */
+line_read_boundaries read_lines(std::string path, std::uint32_t thread_count) {
+  int fd = open(path.c_str(), O_RDONLY);
+  struct stat sb;
+  fstat(fd, &sb);
+  size_t file_size = sb.st_size;
+  // the +64 is for padding just to be safe
+  char *file_content = static_cast<char *>(
+      mmap(NULL, file_size + 64, PROT_READ, MAP_PRIVATE, fd, 0));
 
-    auto threads = std::vector<std::thread>();
+  auto boundaries = line_read_boundaries();
+  boundaries.fd = fd;
+  boundaries.file_size = file_size;
+  boundaries.memory = file_content;
 
-    for (size_t i = 0; i < thread_count; i++) {
-        threads.emplace_back([&, i](){
-            auto &data = entries[i];
-            data.resize(32'768);
+  size_t file_cursor = 0;
+  const auto rough_estimate = file_size / thread_count;
+  for (size_t i = 0; i < thread_count - 1; i++) {
+    auto index = file_cursor + rough_estimate;
+    while (file_content[--index] != '\n')
+      ;
+    boundaries.boundaries.emplace_back(file_content + file_cursor,
+                                       file_content + index);
+    file_cursor = index + 1;
+  }
+  boundaries.boundaries.emplace_back(file_content + file_cursor,
+                                     file_content + file_size);
 
-            while (running) {
-                auto batch_result = batch_data();
-                if (queue.try_dequeue(batch_result)) {
-                    process_batch(
-                            {batch_result.lines.begin(), batch_result.lines.begin() + batch_result.count},
-                            data, [&, i](std::string_view name){
-                               if (i == 0 && names.size() != 413) {
-                                   names.insert(std::string(name));
-                               }
-                            });
-                }
-            }
-        });
-    }
-
-    return threads;
+  return boundaries;
 }
 
-int main() {
-    auto data = std::vector<data_entry>(32'768);
-    auto entries = std::vector<std::vector<data_entry>>(std::thread::hardware_concurrency() - 1);
-    auto names = std::set<std::string>();
+[[nodiscard]] bool get_next_line(char *source, char *end,
+                                 std::string_view &line) {
+  if (source >= end) {
+    return false;
+  }
+  auto total = std::string_view(source, end);
+  if (const auto newline = total.find('\n');
+      newline != std::string_view::npos) {
+    line = {source, source + newline};
+    return true;
+  }
 
-    auto queue = moodycamel::ConcurrentQueue<batch_data>();
+  return false;
+}
 
-    auto running = std::atomic<bool>(true);
+struct worker {
+  // This is REQUIRED have \n as the last character
+  std::byte *data = nullptr;
 
-    auto producer_thread = std::thread([&](){
-        auto reader = buffered_batch_reader<batch_size>("measurements_large.txt");
-        while (true) {
-            auto batch_result = reader.next_batch();
-            if (batch_result.count == 0) {
-                break;
-            }
-            queue.enqueue(batch_result);
-        }
-        running = false;
-    });
+  void run() {}
+};
 
-    for (auto &thread : dispatch_threads(queue, entries, names, running)) {
-        thread.join();
+/**
+ * Takes a string_view of a float in one of the following forms
+ * 1) -XX.X
+ * 2)  XX.X
+ * 3)  -X.X
+ * 4)   X.X
+ * and gives back the fixed point representation of it
+ * @param input The float as a string
+ * @return std::int32_t fixed point representation of the float (* 0.1f to get
+ * original value)
+ */
+[[nodiscard]] int parse_float(std::string_view input) {
+  if (input[0] == '-') {
+    if (input.length() == 5) {
+      return -(((input[1] - '0') * 100) + ((input[2] - '0') * 10) +
+               (input[4] - '0'));
+    } else if (input.length() == 4) {
+      return -(((input[1] - '0') * 10) + (input[3] - '0'));
     }
-    producer_thread.join();
-
-    for (size_t i = 0; i < data.size(); i++) {
-        auto &result = data[i];
-        for (const auto &entry : entries) {
-            auto &against = entry[i];
-            result.min = against.min < result.min ? against.min : result.min;
-            result.max = against.max > result.max ? against.max : result.max;
-            result.sum += against.sum;
-            result.count += against.count;
-        }
+  } else {
+    if (input.length() == 4) {
+      return ((input[0] - '0') * 100) + ((input[1] - '0') * 10) +
+             (input[3] - '0');
+    } else if (input.length() == 3) {
+      return ((input[0] - '0') * 10) + (input[2] - '0');
     }
+  }
+  return 0;
+}
 
-    output_batch(names, data);
+struct parsed_line {
+  struct city city;
+  hash_entry reading;
+};
+[[nodiscard]] parsed_line parse_line(std::string_view line) {
+  const auto semicolon = line.find(';');
 
-    return 0;
+  const auto city_name =
+      std::string_view(line.begin(), line.begin() + semicolon);
+  const auto reading =
+      std::string_view(line.begin() + semicolon + 1, line.end());
+
+  const auto temp = parse_float(reading);
+
+  return {.city =
+              {
+                  .name = city_name,
+              },
+          .reading = {.sum = temp,
+                      .count = 1,
+                      .min = static_cast<std::int16_t>(temp),
+                      .max = static_cast<std::int16_t>(temp)}};
+}
+
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::cerr << "usage: " << argv[0] << " <file>" << std::endl;
+    return 1;
+  }
+
+  auto data = hash_map<city, hash_entry>(100'000);
+
+  const auto boundaries = read_lines(argv[1], 1);
+  auto line = std::string_view();
+  auto source = boundaries.memory;
+  while (
+      get_next_line(source, boundaries.memory + boundaries.file_size, line)) {
+    const auto parsed = parse_line(line);
+    data.update(parsed.city, parsed.reading);
+    source += line.size() + 1;
+  }
+
+  data.print();
+
+  return 0;
 }
