@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -33,20 +34,32 @@ struct hash_entry {
     min = min < entry.min ? min : entry.min;
     max = max > entry.max ? max : entry.max;
   }
+
+  void update(std::int16_t value) {
+    sum += value;
+    count += 1;
+    min = value < min ? value : min;
+    max = value > max ? value : max;
+  }
 };
 
 struct city {
-  std::string_view name = {};
+  const char *name = nullptr;
+  std::uint64_t length = 0;
 
   [[nodiscard]] bool operator==(const city &other) const noexcept {
-    return other.name == this->name;
+    if (other.name == this->name && this->name == nullptr) {
+      return true;
+    }
+    return std::string_view(other.name, other.length) ==
+           std::string_view(this->name, this->length);
   }
 
   [[nodiscard]] std::uint32_t hash() const noexcept {
     auto hash_value = std::uint32_t();
 
-    const auto size = name.size() < 4 ? name.size() : 4;
-    std::memcpy(&hash_value, name.data(), size);
+    const auto size = length < 4 ? length : 4;
+    std::memcpy(&hash_value, name, size);
 
     return hash_value;
   }
@@ -73,6 +86,35 @@ public:
   hash_map &operator=(hash_map &&other) = default;
 
   // hash_map &operator==
+
+  void update(KeyT key, std::int16_t value) {
+    const auto hash = key.hash();
+
+    const auto initial_index = hash % size;
+    auto current_index = initial_index;
+    do {
+      if (keys[current_index] == key) {
+        // Found the entry
+        keys[current_index] = key;
+        values[current_index].update(value);
+        break;
+      } else if (keys[current_index] == KeyT()) {
+        keys[current_index] = key;
+        // Found an open entry, write
+        values[current_index] = {
+            .sum = value,
+            .count = 1,
+            .min = value,
+            .max = value,
+        };
+        break;
+      }
+      // Entry wasn't interesting, continue going forward
+
+      // Automatic loop back
+      current_index = (current_index + 1) % size;
+    } while (current_index != initial_index);
+  }
 
   void update(KeyT key, ValueT value) {
     const auto hash = key.hash();
@@ -117,8 +159,8 @@ public:
           std::cout << ",";
         }
         const auto &entry = values[i];
-        std::cout << keys[i].name << '=' << static_cast<float>(entry.min) * 0.1f
-                  << '/'
+        std::cout << std::string_view(keys[i].name, keys[i].length) << '='
+                  << static_cast<float>(entry.min) * 0.1f << '/'
                   << (static_cast<float>(entry.sum) * 0.1f) /
                          static_cast<float>(entry.count)
                   << '/' << static_cast<float>(entry.max) * 0.1f;
@@ -319,7 +361,8 @@ struct parsed_line {
 
   return {.city =
               {
-                  .name = city_name,
+                  .name = line.begin(),
+                  .length = semicolon,
               },
           .reading = {.sum = temp,
                       .count = 1,
@@ -347,157 +390,105 @@ find_semicolon_indices_safe(const char *__restrict data) {
 
 // you better PINKY PROMISE that data contains 8 semicolons or else shit
 // WILL hit the fan
-[[nodiscard]] std::array<int, 8>
-find_semicolon_indices(const char *__restrict__ data) {
-  static auto semicolon_mask = _mm256_set1_epi8(';');
+struct parsed_delimiters {
+  std::array<int, 8> semicolons = {};
+  std::array<int, 8> newlines = {};
+};
+[[nodiscard]] parsed_delimiters
+parse_delimiters(const char *__restrict__ data) {
+  const auto semicolon_mask = _mm256_set1_epi8(';');
+  const auto newline_mask = _mm256_set1_epi8('\n');
 
-  auto previous_semicolon_write_index = 0;
-  auto current_semicolon_write_index = 0;
-  auto semicolon_indices = std::array<std::int32_t, 8>();
+  auto semicolon_write_index = 0;
+  auto newline_write_index = 0;
+
+  auto delimiters = parsed_delimiters();
 
   auto loop_iteration = 0;
-  while (current_semicolon_write_index != 8) {
+  while (semicolon_write_index != 8 || newline_write_index != 8) {
     const auto str_section = _mm256_loadu_si256(
         reinterpret_cast<const __m256i *>(data + loop_iteration * 32));
-    const auto search_result = _mm256_cmpeq_epi8(str_section, semicolon_mask);
-    auto search_mask =
-        std::bit_cast<std::uint32_t>(_mm256_movemask_epi8(search_result));
 
-    while (search_mask != 0 && current_semicolon_write_index != 8) {
-      const auto first_bit = std::countr_zero(search_mask);
+    const auto semicolons = _mm256_cmpeq_epi8(str_section, semicolon_mask);
+    const auto newlines = _mm256_cmpeq_epi8(str_section, newline_mask);
 
-      // Write the index
-      semicolon_indices[current_semicolon_write_index++] =
+    auto newline_bits =
+        std::bit_cast<std::uint32_t>(_mm256_movemask_epi8(newlines));
+    auto semicolon_bits =
+        std::bit_cast<std::uint32_t>(_mm256_movemask_epi8(semicolons));
+
+    while (semicolon_bits != 0 && semicolon_write_index != 8) {
+      const auto first_bit = std::countr_zero(semicolon_bits);
+
+      delimiters.semicolons[semicolon_write_index++] =
           first_bit + loop_iteration * 32;
-      search_mask &= ~(1u << first_bit);
+      semicolon_bits &= ~(1u << first_bit);
     }
 
-    previous_semicolon_write_index = current_semicolon_write_index;
+    while (newline_bits != 0 && newline_write_index != 8) {
+      const auto first_bit = std::countr_zero(newline_bits);
+      delimiters.newlines[newline_write_index++] =
+          first_bit + loop_iteration * 32;
+      newline_bits &= ~(1u << first_bit);
+    }
+
     loop_iteration += 1;
   }
 
-  return semicolon_indices;
-}
-
-[[nodiscard]] std::array<const char *, 8>
-get_float_ends(const char *__restrict__ data, const int *__restrict__ lengths) {
-  auto result = std::array<const char *, 8>();
-
-  auto offset = 0;
-  for (int i = 0; i < 8; i++) {
-    result[i] = data + offset + lengths[i];
-
-    offset += lengths[i] + 1;
-  }
-
-  return result;
+  return delimiters;
 }
 
 struct parsed_lines {
   std::array<city, 8> cities;
-  std::array<hash_entry, 8> readings;
+  std::array<std::int16_t, 8> readings;
 };
-[[nodiscard]] parsed_lines parse_lines(const char *__restrict__ data,
-                                       const int *__restrict__ line_lengths) {
-  const auto semicolon_indices = find_semicolon_indices(data);
-
+[[nodiscard]] parsed_lines parse_lines(const int *__restrict__ semicolons,
+                                       const int *__restrict__ newlines,
+                                       const char *__restrict__ begin) {
+  auto float_end_ptrs = std::array<const char *, 8>();
   auto cities = std::array<city, 8>();
-  auto readings = std::array<hash_entry, 8>();
 
-  const auto float_end_ptrs = get_float_ends(data, line_lengths);
-  const auto temp_values = parse_floats(float_end_ptrs.data());
-
-  auto line_start_offset = 0;
+  auto line_start = begin;
   for (int i = 0; i < 8; i++) {
-    const auto line_start = data + line_start_offset;
-    const auto semicolon = data + semicolon_indices[i];
-    const auto line_end = line_start + line_lengths[i];
+    const auto city_end =
+        begin + semicolons[i]; // semicolon / newline is from begin
+    cities[i].name = line_start;
+    cities[i].length = city_end - line_start;
+    float_end_ptrs[i] = begin + newlines[i];
 
-    cities[i] = {.name = {line_start, semicolon}};
-
-    readings[i] = {
-        .sum = temp_values[i],
-        .count = 1,
-        .min = static_cast<std::int16_t>(temp_values[i]),
-        .max = static_cast<std::int16_t>(temp_values[i]),
-    };
-
-    line_start_offset +=
-        line_lengths[i] + 1; // our line lengths don't account for the \n
+    // Move line forward
+    line_start = begin + newlines[i] + 1;
   }
 
   return {
       .cities = cities,
-      .readings = readings,
+      .readings = parse_floats(float_end_ptrs.data()),
   };
 }
 
-[[nodiscard]] parsed_lines
-parse_lines(const std::array<std::string_view, 8> &lines) {
-  auto result = parsed_lines();
-
-  auto lengths = std::array<int, 8>();
-  for (int i = 0; i < 8; i++) {
-    lengths[i] = static_cast<std::int32_t>(lines[i].size());
-  }
-  return parse_lines(lines[0].data(), lengths.data());
-}
-
 void process_chunk(std::string_view data, hash_map<city, hash_entry> &results) {
-  auto line_lengths_size = 0;
-  auto lines = std::array<std::string_view, 8>();
+  while (data.size() > 4096) {
+    // who needs bounds checking, we have 4KB buffer
+    const auto delimiters = parse_delimiters(data.data());
+    const auto parsed = parse_lines(delimiters.semicolons.data(),
+                                    delimiters.newlines.data(), data.data());
+    for (int i = 0; i < 8; i++) {
+      results.update(parsed.cities[i], parsed.readings[i]);
+    }
+    data = data.substr(delimiters.newlines[7] + 1);
+  }
 
   auto line = std::string_view();
   while (get_next_line(data, line)) {
-    // Submit the current line
-    lines[line_lengths_size++] = line;
-
-    // Are we full (if so; process everything)
-    if (line_lengths_size == 8) {
-      const auto parsed = parse_lines(lines);
-      for (int i = 0; i < 8; i++) {
-        results.update(parsed.cities[i], parsed.readings[i]);
-      }
-      line_lengths_size = 0;
-    }
-
-    // Increment to the next line to process
+    const auto parsed = parse_line(line);
+    results.update(parsed.city, parsed.reading);
     const auto new_start = data.begin() + line.size() + 1;
     if (new_start >= data.end()) {
       break;
     }
+
     data = {new_start, data.end()};
   }
-
-  // Deal with remaining data
-  for (int i = 0; i < line_lengths_size; i++) {
-    const auto parsed = parse_line(lines[i]);
-    results.update(parsed.city, parsed.reading);
-  }
-}
-
-void test_float_parse() {
-  auto dup = std::array<const char *, 8>({
-      "-0.1",
-      "-1.2",
-      "12.3",
-      ";0.1",
-      ";1.2",
-      "-0.3",
-      "-0.4",
-      "-0.4",
-  });
-
-  for (auto &d : dup) {
-    d += 5;
-  }
-
-  const auto results = parse_floats(dup.data());
-
-  for (auto result : results) {
-    std::cout << result << " ";
-  }
-  std::cout << std::endl;
 }
 
 int main(int argc, char **argv) {
@@ -507,12 +498,14 @@ int main(int argc, char **argv) {
   }
 
   constexpr auto thread_count = 8;
+  constexpr auto hashmap_size = 10'000;
 
   const auto boundaries = read_lines(argv[1], thread_count);
 
+  auto begin = std::chrono::high_resolution_clock::now();
   auto results = std::vector<hash_map<city, hash_entry>>();
   for (int i = 0; i < thread_count; i++) {
-    results.emplace_back(10000);
+    results.emplace_back(hashmap_size);
   }
 
   auto threads = std::vector<std::thread>();
@@ -525,12 +518,24 @@ int main(int argc, char **argv) {
   for (auto &thread : threads) {
     thread.join();
   }
+  auto done_waiting = std::chrono::high_resolution_clock::now();
 
-  auto data = hash_map<city, hash_entry>(10000);
+  auto data = hash_map<city, hash_entry>(hashmap_size);
   for (const auto &result : results) {
     data.merge(result);
   }
 
+  auto finished_merge = std::chrono::high_resolution_clock::now();
+  auto duration_processing =
+      std::chrono::duration_cast<std::chrono::milliseconds>(done_waiting -
+                                                            begin)
+          .count();
+  auto duration_merge = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            finished_merge - done_waiting)
+                            .count();
+  auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            finished_merge - begin)
+                            .count();
   data.print();
 
   return 0;
