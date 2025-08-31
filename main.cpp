@@ -203,22 +203,15 @@ struct worker {
  * original value)
  */
 [[nodiscard]] int parse_float(std::string_view input) {
-  if (input[0] == '-') {
-    if (input.length() == 5) {
-      return -(((input[1] - '0') * 100) + ((input[2] - '0') * 10) +
-               (input[4] - '0'));
-    } else if (input.length() == 4) {
-      return -(((input[1] - '0') * 10) + (input[3] - '0'));
-    }
-  } else {
-    if (input.length() == 4) {
-      return ((input[0] - '0') * 100) + ((input[1] - '0') * 10) +
-             (input[3] - '0');
-    } else if (input.length() == 3) {
-      return ((input[0] - '0') * 10) + (input[2] - '0');
-    }
+  const auto neg = input[0] == '-';
+  const auto ones = input[input.size() - 1] - '0';
+  const auto tens = input[input.size() - 3] - '0';
+  auto hundreds = 0;
+  if ((input.size() == 5 && neg) || (input.size() == 4 && !neg)) {
+    hundreds = input[static_cast<int>(neg)] - '0';
   }
-  return 0;
+
+  return (neg ? -1 : 1) * ((ones) + (tens * 10) + (hundreds * 100));
 }
 
 struct parsed_line {
@@ -257,7 +250,7 @@ int main(int argc, char **argv) {
 
   auto results = std::vector<hash_map<city, hash_entry>>();
   for (int i = 0; i < thread_count; i++) {
-    results.emplace_back(100'000);
+    results.emplace_back(10000);
   }
 
   auto threads = std::vector<std::thread>();
@@ -281,7 +274,7 @@ int main(int argc, char **argv) {
     thread.join();
   }
 
-  auto data = hash_map<city, hash_entry>(100'000);
+  auto data = hash_map<city, hash_entry>(10000);
   for (const auto &result : results) {
     data.merge(result);
   }
