@@ -220,6 +220,89 @@ struct worker {
   return (neg ? -1 : 1) * ((ones) + (tens * 10) + (hundreds * 100));
 }
 
+/**
+ * You thought floating point was safe from being SIMD'ed? nope
+ * The thing to realize, if we dont account for the `-` at the
+ * start of the -XX.X case, we only have 3 cases
+ * XX.X
+ * -X.X
+ * ;X.X
+ * Using some mask and blend, we turn it into
+ * XX.X
+ * 0X.X
+ * Which just becomes
+ * XX.X
+ */
+[[nodiscard]] std::array<std::int16_t, 8>
+parse_floats(char const *const __restrict__ float_ends[8]) {
+  alignas(32) int words[8];
+  for (int i = 0; i < 8; i++) {
+    // read 4 chars "XX.X" directly
+    std::memcpy(&words[i], float_ends[i] - 4, 4);
+  }
+  constexpr auto hundreds_factor = std::uint64_t(100);
+  constexpr auto tens_factor = std::uint64_t(10);
+  constexpr auto bullshit_dot_factor = std::uint64_t(0);
+  constexpr auto ones_factor = std::uint64_t(1);
+  constexpr auto multipler_magic = (ones_factor << 48) |
+                                   (bullshit_dot_factor << 32) |
+                                   (tens_factor << 16) | (hundreds_factor << 0);
+  const auto multipler = _mm256_set1_epi64x(multipler_magic);
+
+  const auto raw_chars =
+      _mm256_load_si256(reinterpret_cast<const __m256i *>(words));
+
+  // Let's clean this up shall we?
+  const auto semi_mask = _mm256_cmpeq_epi8(raw_chars, _mm256_set1_epi8(';'));
+  const auto neg_mask = _mm256_cmpeq_epi8(raw_chars, _mm256_set1_epi8('-'));
+  const auto fix_mask = _mm256_or_si256(semi_mask, neg_mask);
+
+  // Everything is in XX.X (character now)
+  const auto chars =
+      _mm256_blendv_epi8(raw_chars, _mm256_set1_epi8('0'), fix_mask);
+  // Bring everything to their actual numerical values
+  const auto digits = _mm256_sub_epi8(chars, _mm256_set1_epi8('0'));
+
+  // hi im avx and i dont give 8bit * 8bit for some god foresaken reason
+  // Contains the lower 4
+  const auto digits16_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(digits));
+  // Contains the higher 4
+  const auto digits16_hi =
+      _mm256_cvtepu8_epi16(_mm256_extracti128_si256(digits, 1));
+
+  const auto low_values = _mm256_mullo_epi16(digits16_lo, multipler);
+  const auto high_values = _mm256_mullo_epi16(digits16_hi, multipler);
+
+  // Partial sum between (lane[n] + lane[n + 1])
+  const auto low_partial = _mm256_hadd_epi16(low_values, low_values);
+  const auto final_low_partial = _mm256_hadd_epi16(low_partial, low_partial);
+  const auto high_partial = _mm256_hadd_epi16(high_values, high_values);
+  const auto final_high_partial = _mm256_hadd_epi16(high_partial, high_partial);
+
+  // We're going to store both vectors here in the same array
+  alignas(16) std::int16_t outputs_duplicated[32];
+  _mm256_storeu_si256(reinterpret_cast<__m256i *>(outputs_duplicated),
+                      final_low_partial);
+  _mm256_storeu_si256(reinterpret_cast<__m256i *>(outputs_duplicated + 16),
+                      final_high_partial);
+
+  // Does a faster way to do this exist? Probably
+  auto values = std::array{
+      outputs_duplicated[0 + 0],  outputs_duplicated[0 + 1],
+      outputs_duplicated[0 + 8],  outputs_duplicated[0 + 9],
+      outputs_duplicated[16 + 0], outputs_duplicated[16 + 1],
+      outputs_duplicated[16 + 8], outputs_duplicated[16 + 9],
+  };
+  auto negatives = std::array<std::int16_t, 8>();
+  for (int i = 0; i < 8; i++) {
+    negatives[i] =
+        (float_ends[i][-5] == '-') || (float_ends[i][-4] == '-') ? -1 : 1;
+    negatives[i] *= values[i];
+  }
+
+  return negatives;
+}
+
 struct parsed_line {
   struct city city;
   hash_entry reading;
@@ -296,6 +379,20 @@ find_semicolon_indices(const char *__restrict__ data) {
   return semicolon_indices;
 }
 
+[[nodiscard]] std::array<const char *, 8>
+get_float_ends(const char *__restrict__ data, const int *__restrict__ lengths) {
+  auto result = std::array<const char *, 8>();
+
+  auto offset = 0;
+  for (int i = 0; i < 8; i++) {
+    result[i] = data + offset + lengths[i];
+
+    offset += lengths[i] + 1;
+  }
+
+  return result;
+}
+
 struct parsed_lines {
   std::array<city, 8> cities;
   std::array<hash_entry, 8> readings;
@@ -307,6 +404,9 @@ struct parsed_lines {
   auto cities = std::array<city, 8>();
   auto readings = std::array<hash_entry, 8>();
 
+  const auto float_end_ptrs = get_float_ends(data, line_lengths);
+  const auto temp_values = parse_floats(float_end_ptrs.data());
+
   auto line_start_offset = 0;
   for (int i = 0; i < 8; i++) {
     const auto line_start = data + line_start_offset;
@@ -315,12 +415,11 @@ struct parsed_lines {
 
     cities[i] = {.name = {line_start, semicolon}};
 
-    const auto temp = parse_float({semicolon + 1, line_end});
     readings[i] = {
-        .sum = temp,
+        .sum = temp_values[i],
         .count = 1,
-        .min = static_cast<std::int16_t>(temp),
-        .max = static_cast<std::int16_t>(temp),
+        .min = static_cast<std::int16_t>(temp_values[i]),
+        .max = static_cast<std::int16_t>(temp_values[i]),
     };
 
     line_start_offset +=
@@ -375,6 +474,30 @@ void process_chunk(std::string_view data, hash_map<city, hash_entry> &results) {
     const auto parsed = parse_line(lines[i]);
     results.update(parsed.city, parsed.reading);
   }
+}
+
+void test_float_parse() {
+  auto dup = std::array<const char *, 8>({
+      "-0.1",
+      "-1.2",
+      "12.3",
+      ";0.1",
+      ";1.2",
+      "-0.3",
+      "-0.4",
+      "-0.4",
+  });
+
+  for (auto &d : dup) {
+    d += 5;
+  }
+
+  const auto results = parse_floats(dup.data());
+
+  for (auto result : results) {
+    std::cout << result << " ";
+  }
+  std::cout << std::endl;
 }
 
 int main(int argc, char **argv) {
