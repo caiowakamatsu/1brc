@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <iomanip>
@@ -57,6 +58,16 @@ public:
       : values(std::make_unique<ValueT[]>(size)),
         keys(std::make_unique<KeyT[]>(size)), size(size) {}
 
+  hash_map(hash_map<KeyT, ValueT> &&other) noexcept
+      : values(std::move(other.values)), keys(std::move(other.keys)),
+        size(other.size) {}
+
+  hash_map(const hash_map &other) = delete;
+
+  hash_map &operator=(hash_map &&other) = default;
+
+  // hash_map &operator==
+
   void update(KeyT key, ValueT value) {
     const auto hash = key.hash();
 
@@ -81,39 +92,30 @@ public:
     } while (current_index != initial_index);
   }
 
-  [[nodiscard]] hash_map<KeyT, ValueT>
-  merge(const hash_map<KeyT, ValueT> other) const {
-    auto merged = hash_map(*this);
+  void merge(const hash_map<KeyT, ValueT> &other) {
     for (std::uint64_t i = 0; i < other.size; i++) {
       if (other.keys[i] != KeyT()) {
-        merged.update(other.keys[i], other.values[i]);
+        update(other.keys[i], other.values[i]);
       }
     }
-    return merged;
-  }
-
-  hash_map(const hash_map<KeyT, ValueT> &other)
-      : values(std::make_unique<ValueT[]>(size)),
-        keys(std::make_unique<KeyT[]>(size)), size(size) {
-    std::memcpy(values.get(), other.values.get(), sizeof(ValueT) * size);
-    std::memcpy(keys.get(), other.keys.get(), sizeof(keys) * size);
   }
 
   void print() const noexcept {
     std::cout << '{';
     std::cout << std::fixed;
     std::cout << std::setprecision(1);
+    auto valid = 0;
     for (std::uint64_t i = 0; i < size; i++) {
       if (keys[i] != KeyT()) {
+        if (valid++ != 0) {
+          std::cout << ",";
+        }
         const auto &entry = values[i];
         std::cout << keys[i].name << '=' << static_cast<float>(entry.min) * 0.1f
                   << '/'
                   << (static_cast<float>(entry.sum) * 0.1f) /
                          static_cast<float>(entry.count)
                   << '/' << static_cast<float>(entry.max) * 0.1f;
-        if (i + 1 != size) {
-          std::cout << ',';
-        }
       }
     }
     std::cout << '}';
@@ -132,7 +134,8 @@ struct line_read_boundaries {
   }
 };
 /**
- * Sets up all of the required resources for threads to do their work afterwards
+ * Sets up all of the required resources for threads to do their work
+ * afterwards
  * @param path Path to measurements file
  * @param thread_count Amount of threads that will aggregate the data
  * @return Boundaries and resources required for doing work
@@ -167,15 +170,14 @@ line_read_boundaries read_lines(std::string path, std::uint32_t thread_count) {
   return boundaries;
 }
 
-[[nodiscard]] bool get_next_line(char *source, char *end,
+[[nodiscard]] bool get_next_line(std::string_view &source,
                                  std::string_view &line) {
-  if (source >= end) {
+  if (source.empty()) {
     return false;
   }
-  auto total = std::string_view(source, end);
-  if (const auto newline = total.find('\n');
+  if (const auto newline = source.find('\n');
       newline != std::string_view::npos) {
-    line = {source, source + newline};
+    line = source.substr(0, newline);
     return true;
   }
 
@@ -249,16 +251,39 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  auto data = hash_map<city, hash_entry>(100'000);
+  constexpr auto thread_count = 8;
 
-  const auto boundaries = read_lines(argv[1], 1);
-  auto line = std::string_view();
-  auto source = boundaries.memory;
-  while (
-      get_next_line(source, boundaries.memory + boundaries.file_size, line)) {
-    const auto parsed = parse_line(line);
-    data.update(parsed.city, parsed.reading);
-    source += line.size() + 1;
+  const auto boundaries = read_lines(argv[1], thread_count);
+
+  auto results = std::vector<hash_map<city, hash_entry>>();
+  for (int i = 0; i < thread_count; i++) {
+    results.emplace_back(100'000);
+  }
+
+  auto threads = std::vector<std::thread>();
+  for (int i = 0; i < thread_count; i++) {
+    threads.emplace_back([&boundaries, &results, index = i]() {
+      auto data = boundaries.boundaries[index];
+      auto line = std::string_view();
+      while (get_next_line(data, line)) {
+        const auto parsed = parse_line(line);
+        results[index].update(parsed.city, parsed.reading);
+        const auto new_start = data.begin() + line.size() + 1;
+        if (new_start >= data.end()) {
+          break;
+        }
+        data = {new_start, data.end()};
+      }
+    });
+  }
+
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  auto data = hash_map<city, hash_entry>(100'000);
+  for (const auto &result : results) {
+    data.merge(result);
   }
 
   data.print();
