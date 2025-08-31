@@ -1,9 +1,14 @@
+#include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -14,18 +19,19 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <immintrin.h>
+
 struct hash_entry {
   std::int64_t sum = 0;
   std::uint32_t count = 0;
   std::int16_t min = std::numeric_limits<std::int16_t>::max();
   std::int16_t max = std::numeric_limits<std::int16_t>::min();
 
-  hash_entry operator+=(hash_entry entry) {
+  void update(hash_entry &entry) {
     sum += entry.sum;
     count += entry.count;
     min = min < entry.min ? min : entry.min;
     max = max > entry.max ? max : entry.max;
-    return *this;
   }
 };
 
@@ -77,7 +83,7 @@ public:
       if (keys[current_index] == key) {
         // Found the entry
         keys[current_index] = key;
-        values[current_index] += value;
+        values[current_index].update(value);
         break;
       } else if (keys[current_index] == KeyT()) {
         keys[current_index] = key;
@@ -238,6 +244,139 @@ struct parsed_line {
                       .max = static_cast<std::int16_t>(temp)}};
 }
 
+[[nodiscard]] std::array<int, 8>
+find_semicolon_indices_safe(const char *__restrict data) {
+  static auto semicolon_mask = _mm256_set1_epi8(';');
+
+  auto previous_semicolon_write_index = 0;
+  auto current_semicolon_write_index = 0;
+  auto semicolon_indices = std::array<std::int32_t, 8>();
+
+  int i = 0;
+  while (current_semicolon_write_index != 8) {
+    if (*(data + i) == ';') {
+      semicolon_indices[current_semicolon_write_index++] = i;
+    }
+    i += 1;
+  }
+  return semicolon_indices;
+}
+
+// you better PINKY PROMISE that data contains 8 semicolons or else shit
+// WILL hit the fan
+[[nodiscard]] std::array<int, 8>
+find_semicolon_indices(const char *__restrict__ data) {
+  static auto semicolon_mask = _mm256_set1_epi8(';');
+
+  auto previous_semicolon_write_index = 0;
+  auto current_semicolon_write_index = 0;
+  auto semicolon_indices = std::array<std::int32_t, 8>();
+
+  auto loop_iteration = 0;
+  while (current_semicolon_write_index != 8) {
+    const auto str_section = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i *>(data + loop_iteration * 32));
+    const auto search_result = _mm256_cmpeq_epi8(str_section, semicolon_mask);
+    auto search_mask =
+        std::bit_cast<std::uint32_t>(_mm256_movemask_epi8(search_result));
+
+    while (search_mask != 0 && current_semicolon_write_index != 8) {
+      const auto first_bit = std::countr_zero(search_mask);
+
+      // Write the index
+      semicolon_indices[current_semicolon_write_index++] =
+          first_bit + loop_iteration * 32;
+      search_mask &= ~(1u << first_bit);
+    }
+
+    previous_semicolon_write_index = current_semicolon_write_index;
+    loop_iteration += 1;
+  }
+
+  return semicolon_indices;
+}
+
+struct parsed_lines {
+  std::array<city, 8> cities;
+  std::array<hash_entry, 8> readings;
+};
+[[nodiscard]] parsed_lines parse_lines(const char *__restrict__ data,
+                                       const int *__restrict__ line_lengths) {
+  const auto semicolon_indices = find_semicolon_indices(data);
+
+  auto cities = std::array<city, 8>();
+  auto readings = std::array<hash_entry, 8>();
+
+  auto line_start_offset = 0;
+  for (int i = 0; i < 8; i++) {
+    const auto line_start = data + line_start_offset;
+    const auto semicolon = data + semicolon_indices[i];
+    const auto line_end = line_start + line_lengths[i];
+
+    cities[i] = {.name = {line_start, semicolon}};
+
+    const auto temp = parse_float({semicolon + 1, line_end});
+    readings[i] = {
+        .sum = temp,
+        .count = 1,
+        .min = static_cast<std::int16_t>(temp),
+        .max = static_cast<std::int16_t>(temp),
+    };
+
+    line_start_offset +=
+        line_lengths[i] + 1; // our line lengths don't account for the \n
+  }
+
+  return {
+      .cities = cities,
+      .readings = readings,
+  };
+}
+
+[[nodiscard]] parsed_lines
+parse_lines(const std::array<std::string_view, 8> &lines) {
+  auto result = parsed_lines();
+
+  auto lengths = std::array<int, 8>();
+  for (int i = 0; i < 8; i++) {
+    lengths[i] = static_cast<std::int32_t>(lines[i].size());
+  }
+  return parse_lines(lines[0].data(), lengths.data());
+}
+
+void process_chunk(std::string_view data, hash_map<city, hash_entry> &results) {
+  auto line_lengths_size = 0;
+  auto lines = std::array<std::string_view, 8>();
+
+  auto line = std::string_view();
+  while (get_next_line(data, line)) {
+    // Submit the current line
+    lines[line_lengths_size++] = line;
+
+    // Are we full (if so; process everything)
+    if (line_lengths_size == 8) {
+      const auto parsed = parse_lines(lines);
+      for (int i = 0; i < 8; i++) {
+        results.update(parsed.cities[i], parsed.readings[i]);
+      }
+      line_lengths_size = 0;
+    }
+
+    // Increment to the next line to process
+    const auto new_start = data.begin() + line.size() + 1;
+    if (new_start >= data.end()) {
+      break;
+    }
+    data = {new_start, data.end()};
+  }
+
+  // Deal with remaining data
+  for (int i = 0; i < line_lengths_size; i++) {
+    const auto parsed = parse_line(lines[i]);
+    results.update(parsed.city, parsed.reading);
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) {
     std::cerr << "usage: " << argv[0] << " <file>" << std::endl;
@@ -256,17 +395,7 @@ int main(int argc, char **argv) {
   auto threads = std::vector<std::thread>();
   for (int i = 0; i < thread_count; i++) {
     threads.emplace_back([&boundaries, &results, index = i]() {
-      auto data = boundaries.boundaries[index];
-      auto line = std::string_view();
-      while (get_next_line(data, line)) {
-        const auto parsed = parse_line(line);
-        results[index].update(parsed.city, parsed.reading);
-        const auto new_start = data.begin() + line.size() + 1;
-        if (new_start >= data.end()) {
-          break;
-        }
-        data = {new_start, data.end()};
-      }
+      process_chunk(boundaries.boundaries[index], results[index]);
     });
   }
 
